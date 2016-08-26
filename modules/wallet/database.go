@@ -28,6 +28,8 @@ var (
 	// chronological order. Only transactions relevant to the wallet are
 	// stored. The key of this bucket is an autoincrementing integer.
 	bucketProcessedTransactions = []byte("bucketProcessedTransactions")
+	// bucketSeedFiles stores the (encrypted) auxiliary seeds of the wallet.
+	bucketSeedFiles = []byte("bucketSeedFiles")
 	// bucketSiacoinOutputs maps a SiacoinOutputID to its SiacoinOutput. Only
 	// outputs that the wallet controls are stored. The wallet uses these
 	// outputs to fund transactions.
@@ -36,20 +38,38 @@ var (
 	// outputs that the wallet controls are stored. The wallet uses these
 	// outputs to fund transactions.
 	bucketSiafundOutputs = []byte("bucketSiafundOutputs")
+	// bucketSpendableKeyFiles stores the (encrypted) spendableKeys of the
+	// wallet that were not generated via seed. In practice, this means keys
+	// that were imported from a 0.3.3.x wallet or from a siag file.
+	bucketSpendableKeyFiles = []byte("bucketSpendableKeyFiles")
 	// bucketSpentOutputs maps an OutputID to the height at which it was
 	// spent. Only outputs spent by the wallet are stored. The wallet tracks
 	// these outputs so that it can reuse them if they are not confirmed on
 	// the blockchain.
 	bucketSpentOutputs = []byte("bucketSpentOutputs")
+	// bucketWallet contains various fields needed by the wallet, such as its
+	// UID, EncryptionVerification, and PrimarySeedFile.
+	bucketWallet = []byte("bucketWallet")
 
 	dbBuckets = [][]byte{
 		bucketHistoricClaimStarts,
 		bucketHistoricOutputs,
 		bucketProcessedTransactions,
+		bucketSeedFiles,
 		bucketSiacoinOutputs,
 		bucketSiafundOutputs,
+		bucketSpendableKeyFiles,
 		bucketSpentOutputs,
+		bucketWallet,
 	}
+
+	// these keys are used in bucketWallet
+	keyUID                    = []byte("keyUID")
+	keyEncryptionVerification = []byte("keyEncryptionVerification")
+	keyPrimarySeedFile        = []byte("keyPrimarySeedFile")
+	keyPrimarySeedProgress    = []byte("keyPrimarySeedProgress")
+	keyConsensusChange        = []byte("keyConsensusChange")
+	keyConsensusHeight        = []byte("keyConsensusHeight")
 )
 
 // dbPut is a helper function for storing a marshalled key/value pair.
@@ -179,4 +199,51 @@ func dbForEachProcessedTransaction(tx *bolt.Tx, fn func(modules.ProcessedTransac
 	return dbForEach(tx.Bucket(bucketProcessedTransactions), func(_ uint64, pt modules.ProcessedTransaction) {
 		fn(pt)
 	})
+}
+
+// dbGetWalletUID returns the UID assigned to the wallet's primary seed.
+func dbGetWalletUID(tx *bolt.Tx) (uid uniqueID) {
+	copy(uid[:], tx.Bucket(bucketWallet).Get(keyUID))
+	return
+}
+
+// dbGetPrimarySeedProgress returns the number of keys generated from the
+// primary seed.
+func dbGetPrimarySeedProgress(tx *bolt.Tx) (progress uint64, err error) {
+	err = encoding.Unmarshal(tx.Bucket(bucketWallet).Get(keyPrimarySeedProgress), &progress)
+	return
+}
+
+// dbIncrementPrimarySeedProgress increments the primary seed progress counter
+// and returns the pre-increment value. It should be called whenever a new key
+// is generated from the seed.
+func dbIncrementPrimarySeedProgress(tx *bolt.Tx) (uint64, error) {
+	progress, err := dbGetPrimarySeedProgress(tx)
+	if err != nil {
+		return 0, err
+	}
+	err = tx.Bucket(bucketWallet).Put(keyPrimarySeedProgress, encoding.Marshal(progress+1))
+	return progress, err
+}
+
+// dbGetConsensusChangeID returns the ID of the last ConsensusChange processed by the wallet.
+func dbGetConsensusChangeID(tx *bolt.Tx) (cc modules.ConsensusChangeID) {
+	copy(cc[:], tx.Bucket(bucketWallet).Get(keyConsensusChange))
+	return
+}
+
+// dbPutConsensusChangeID stores the ID of the last ConsensusChange processed by the wallet.
+func dbPutConsensusChangeID(tx *bolt.Tx, cc modules.ConsensusChangeID) error {
+	return tx.Bucket(bucketWallet).Put(keyConsensusChange, cc[:])
+}
+
+// dbGetConsensusHeight returns the height that the wallet has scanned to.
+func dbGetConsensusHeight(tx *bolt.Tx) (height types.BlockHeight, err error) {
+	err = encoding.Unmarshal(tx.Bucket(bucketWallet).Get(keyConsensusHeight), &height)
+	return
+}
+
+// dbPutConsensusHeight stores the height that the wallet has scanned to.
+func dbPutConsensusHeight(tx *bolt.Tx, height types.BlockHeight) error {
+	return tx.Bucket(bucketWallet).Put(keyConsensusHeight, encoding.Marshal(height))
 }

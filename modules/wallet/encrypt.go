@@ -8,8 +8,10 @@ import (
 
 	"github.com/NebulousLabs/Sia/build"
 	"github.com/NebulousLabs/Sia/crypto"
+	"github.com/NebulousLabs/Sia/encoding"
 	"github.com/NebulousLabs/Sia/modules"
 	"github.com/NebulousLabs/Sia/types"
+	"github.com/NebulousLabs/bolt"
 )
 
 var (
@@ -17,7 +19,11 @@ var (
 	errReencrypt         = errors.New("wallet is already encrypted, cannot encrypt again")
 	errUnencryptedWallet = errors.New("wallet has not been encrypted yet")
 
-	unlockModifier = types.Specifier{'u', 'n', 'l', 'o', 'c', 'k'}
+	// verificationPlaintext is the plaintext used to verify encryption keys.
+	// By storing the corresponding ciphertext for a given key, we can later
+	// verify that a key is correct by using it to decrypt the ciphertext and
+	// comparing the result to verificationPlaintext.
+	verificationPlaintext = make([]byte, 32)
 )
 
 // uidEncryptionKey creates an encryption key that is used to decrypt a
@@ -26,60 +32,86 @@ func uidEncryptionKey(masterKey crypto.TwofishKey, uid uniqueID) crypto.TwofishK
 	return crypto.TwofishKey(crypto.HashAll(masterKey, uid))
 }
 
-// checkMasterKey verifies that the master key is correct.
-func (w *Wallet) checkMasterKey(masterKey crypto.TwofishKey) error {
-	uk := uidEncryptionKey(masterKey, w.persist.UID)
-	verification, err := uk.DecryptBytes(w.persist.EncryptionVerification)
+// verifyEncryption verifies that key properly decrypts the ciphertext to a
+// preset plaintext.
+func verifyEncryption(key crypto.TwofishKey, encrypted crypto.Ciphertext) error {
+	verification, err := key.DecryptBytes(encrypted)
 	if err != nil {
-		// Most of the time, the failure is an authentication failure.
 		return modules.ErrBadEncryptionKey
 	}
-	expected := make([]byte, encryptionVerificationLen)
-	if !bytes.Equal(expected, verification) {
+	if !bytes.Equal(verificationPlaintext, verification) {
 		return modules.ErrBadEncryptionKey
 	}
 	return nil
+}
+
+// checkMasterKey verifies that the masterKey is the key used to encrypt the wallet.
+func checkMasterKey(tx *bolt.Tx, masterKey crypto.TwofishKey) error {
+	uk := uidEncryptionKey(masterKey, dbGetWalletUID(tx))
+	encryptedVerification := tx.Bucket(bucketWallet).Get(keyEncryptionVerification)
+	return verifyEncryption(uk, encryptedVerification)
 }
 
 // initEncryption checks that the provided encryption key is the valid
 // encryption key for the wallet. If encryption has not yet been established
 // for the wallet, an encryption key is created.
 func (w *Wallet) initEncryption(masterKey crypto.TwofishKey) (modules.Seed, error) {
-	// Check if the wallet encryption key has already been set.
-	if len(w.persist.EncryptionVerification) != 0 {
-		return modules.Seed{}, errReencrypt
-	}
-
-	// Create a random seed and use it to generate the seed file for the
-	// wallet.
+	// Create a random seed.
 	var seed modules.Seed
 	_, err := rand.Read(seed[:])
 	if err != nil {
 		return modules.Seed{}, err
 	}
 
-	// If the input key is blank, use the seed to create the master key.
-	// Otherwise, use the input key.
-	if masterKey == (crypto.TwofishKey{}) {
-		masterKey = crypto.TwofishKey(crypto.HashObject(seed))
-	}
-	err = w.createSeed(masterKey, seed)
+	err = w.db.Update(func(tx *bolt.Tx) error {
+		wb := tx.Bucket(bucketWallet)
+		// Check if the wallet encryption key has already been set.
+		if wb.Get(keyEncryptionVerification) != nil {
+			return errReencrypt
+		}
+
+		// If the input key is blank, use the hash of the seed to create the
+		// master key. Otherwise, use the input key.
+		if masterKey == (crypto.TwofishKey{}) {
+			masterKey = crypto.TwofishKey(crypto.HashObject(seed))
+		}
+
+		// create a seedFile for the seed
+		sf, err := createSeedFile(masterKey, seed)
+		if err != nil {
+			return err
+		}
+
+		// set this as the primary seedFile
+		err = wb.Put(keyPrimarySeedFile, encoding.Marshal(sf))
+		if err != nil {
+			return err
+		}
+		err = wb.Put(keyPrimarySeedProgress, encoding.Marshal(uint64(0)))
+		if err != nil {
+			return err
+		}
+
+		// Establish the encryption verification using the masterKey. After this
+		// point, the wallet is encrypted.
+		uk := uidEncryptionKey(masterKey, dbGetWalletUID(tx))
+		verification, err := uk.EncryptBytes(verificationPlaintext)
+		if err != nil {
+			return err
+		}
+		err = wb.Put(keyEncryptionVerification, verification[:])
+		if err != nil {
+			return err
+		}
+		return nil
+	})
 	if err != nil {
 		return modules.Seed{}, err
 	}
 
-	// Establish the encryption verification using the masterKey. After this
-	// point, the wallet is encrypted.
-	uk := uidEncryptionKey(masterKey, w.persist.UID)
-	encryptionBase := make([]byte, encryptionVerificationLen)
-	w.persist.EncryptionVerification, err = uk.EncryptBytes(encryptionBase)
-	if err != nil {
-		return modules.Seed{}, err
-	}
-	err = w.saveSettings()
-	if err != nil {
-		return modules.Seed{}, err
-	}
+	// on future startups, this field will be set by w.initPersist
+	w.encrypted = true
+
 	return seed, nil
 }
 
@@ -87,42 +119,108 @@ func (w *Wallet) initEncryption(masterKey crypto.TwofishKey) (modules.Seed, erro
 // after loading, the structures are kept encrypted, but some data such as
 // addresses are decrypted so that the wallet knows what to track.
 func (w *Wallet) managedUnlock(masterKey crypto.TwofishKey) error {
-	var subscribed bool
-	err := func() error {
+	w.mu.RLock()
+	unlocked := w.unlocked
+	encrypted := w.encrypted
+	w.mu.RUnlock()
+	if unlocked {
+		return errAlreadyUnlocked
+	} else if !encrypted {
+		return errUnencryptedWallet
+	}
+
+	// Load db objects into memory.
+	var lastChange modules.ConsensusChangeID
+	var primarySeedFile seedFile
+	var primarySeedProgress uint64
+	var auxiliarySeedFiles []seedFile
+	var unseededKeyFiles []spendableKeyFile
+	err := w.db.View(func(tx *bolt.Tx) error {
+		// verify masterKey
+		err := checkMasterKey(tx, masterKey)
+		if err != nil {
+			return err
+		}
+
+		// lastChange
+		lastChange = dbGetConsensusChangeID(tx)
+
+		// primarySeedFile + primarySeedProgress
+		err = encoding.Unmarshal(tx.Bucket(bucketWallet).Get(keyPrimarySeedFile), &primarySeedFile)
+		if err != nil {
+			return err
+		}
+		err = encoding.Unmarshal(tx.Bucket(bucketWallet).Get(keyPrimarySeedProgress), &primarySeedProgress)
+		if err != nil {
+			return err
+		}
+
+		// auxiliarySeedFiles
+		err = tx.Bucket(bucketSeedFiles).ForEach(func(_, sfBytes []byte) error {
+			var sf seedFile
+			err := encoding.Unmarshal(sfBytes, &sf)
+			if err != nil {
+				return err
+			}
+			auxiliarySeedFiles = append(auxiliarySeedFiles, sf)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+
+		// unseededKeyFiles
+		err = tx.Bucket(bucketSpendableKeyFiles).ForEach(func(_, ukfBytes []byte) error {
+			var ukf spendableKeyFile
+			err := encoding.Unmarshal(ukfBytes, &ukf)
+			if err != nil {
+				return err
+			}
+			unseededKeyFiles = append(unseededKeyFiles, ukf)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// Decrypt + load keys.
+	err = func() error {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		subscribed = w.subscribed
 
-		// Wallet should only be unlocked once.
-		if w.unlocked {
-			return errAlreadyUnlocked
-		}
-
-		// Check if the wallet encryption key has already been set.
-		if len(w.persist.EncryptionVerification) == 0 {
-			return errUnencryptedWallet
-		}
-
-		// Initialize the encryption of the wallet.
-		err := w.checkMasterKey(masterKey)
+		// primarySeedFile
+		primarySeed, err := decryptSeedFile(masterKey, primarySeedFile)
 		if err != nil {
 			return err
 		}
+		w.integrateSeed(primarySeed, primarySeedProgress)
+		w.primarySeed = primarySeed
 
-		// Load the wallet seed that is used to generate new addresses.
-		err = w.initPrimarySeed(masterKey)
-		if err != nil {
-			return err
+		// auxiliarySeedFiles
+		for _, sf := range auxiliarySeedFiles {
+			auxSeed, err := decryptSeedFile(masterKey, sf)
+			if err != nil {
+				return err
+			}
+			w.integrateSeed(auxSeed, modules.PublicKeysPerSeed)
+			w.seeds = append(w.seeds, auxSeed)
 		}
 
-		// Load all wallet seeds that are not used to generate new addresses.
-		err = w.initAuxiliarySeeds(masterKey)
-		if err != nil {
-			return err
+		// unseededKeyFiles
+		for _, uk := range unseededKeyFiles {
+			sk, err := decryptSpendableKeyFile(masterKey, uk)
+			if err != nil {
+				return err
+			}
+			w.integrateSpendableKey(masterKey, sk)
 		}
-
-		// Load all keys that were not generated by a seed.
-		return w.initUnseededKeys(masterKey)
+		return nil
 	}()
 	if err != nil {
 		return err
@@ -130,25 +228,48 @@ func (w *Wallet) managedUnlock(masterKey crypto.TwofishKey) error {
 
 	// Subscribe to the consensus set if this is the first unlock for the
 	// wallet object.
+	w.mu.RLock()
+	subscribed := w.subscribed
+	w.mu.RUnlock()
 	if !subscribed {
-		// During rescan, print height every 3 seconds.
-		if build.Release != "testing" {
-			go func() {
-				println("Rescanning consensus set...")
-				for range time.Tick(time.Second * 3) {
-					w.mu.RLock()
-					height := w.consensusSetHeight
-					done := w.subscribed
-					w.mu.RUnlock()
-					if done {
-						println("\nDone!")
-						break
+		err = w.cs.ConsensusSetSubscribe(w, lastChange)
+		if err == modules.ErrInvalidConsensusChangeID {
+			// something went wrong; resubscribe from the beginning and spawn a
+			// goroutine to display rescan progress
+			if build.Release != "testing" {
+				go func() {
+					println("Rescanning consensus set...")
+					for range time.Tick(time.Second * 3) {
+						w.mu.RLock()
+						var height types.BlockHeight
+						w.db.View(func(tx *bolt.Tx) error {
+							var err error
+							height, err = dbGetConsensusHeight(tx)
+							return err
+						})
+						done := w.subscribed
+						w.mu.RUnlock()
+						if done {
+							println("\nDone!")
+							break
+						}
+						print("\rScanned to height ", height, "...")
 					}
-					print("\rScanned to height ", height, "...")
+				}()
+			}
+			// set the db entries for consensus change and consensus height
+			err = w.db.Update(func(tx *bolt.Tx) error {
+				err := dbPutConsensusChangeID(tx, modules.ConsensusChangeBeginning)
+				if err != nil {
+					return err
 				}
-			}()
+				return dbPutConsensusHeight(tx, 0)
+			})
+			if err != nil {
+				return errors.New("failed to reset db during rescan: " + err.Error())
+			}
+			err = w.cs.ConsensusSetSubscribe(w, modules.ConsensusChangeBeginning)
 		}
-		err = w.cs.ConsensusSetSubscribe(w, modules.ConsensusChangeBeginning)
 		if err != nil {
 			return errors.New("wallet subscription failed: " + err.Error())
 		}
@@ -184,10 +305,10 @@ func (w *Wallet) wipeSecrets() {
 func (w *Wallet) Encrypted() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if build.DEBUG && w.unlocked && len(w.persist.EncryptionVerification) == 0 {
+	if build.DEBUG && w.unlocked && !w.encrypted {
 		panic("wallet is both unlocked and unencrypted")
 	}
-	return len(w.persist.EncryptionVerification) != 0
+	return w.encrypted
 }
 
 // Encrypt will encrypt the wallet using the input key. Upon encryption, a
@@ -226,8 +347,9 @@ func (w *Wallet) Lock() error {
 	}
 	w.log.Println("INFO: Locking wallet.")
 
-	// Wipe all of the seeds and secret keys, they will be replaced upon
-	// calling 'Unlock' again.
+	// Wipe all of the seeds and secret keys. They will be replaced upon
+	// calling 'Unlock' again. Note that since the public keys are not wiped,
+	// we can continue processing blocks.
 	w.wipeSecrets()
 	w.unlocked = false
 	return nil

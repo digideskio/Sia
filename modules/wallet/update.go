@@ -64,8 +64,8 @@ func (w *Wallet) updateConfirmedSet(tx *bolt.Tx, cc modules.ConsensusChange) err
 
 // revertHistory reverts any transaction history that was destroyed by reverted
 // blocks in the consensus change.
-func (w *Wallet) revertHistory(tx *bolt.Tx, cc modules.ConsensusChange) error {
-	for _, block := range cc.RevertedBlocks {
+func (w *Wallet) revertHistory(tx *bolt.Tx, reverted []types.Block) error {
+	for _, block := range reverted {
 		// Remove any transactions that have been reverted.
 		for i := len(block.Transactions) - 1; i >= 0; i-- {
 			// If the transaction is relevant to the wallet, it will be the
@@ -91,7 +91,16 @@ func (w *Wallet) revertHistory(tx *bolt.Tx, cc modules.ConsensusChange) error {
 				break
 			}
 		}
-		w.consensusSetHeight--
+
+		// decrement the consensus height
+		consensusHeight, err := dbGetConsensusHeight(tx)
+		if err != nil {
+			return err
+		}
+		err = dbPutConsensusHeight(tx, consensusHeight-1)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -100,7 +109,17 @@ func (w *Wallet) revertHistory(tx *bolt.Tx, cc modules.ConsensusChange) error {
 // applied blocks.
 func (w *Wallet) applyHistory(tx *bolt.Tx, applied []types.Block) error {
 	for _, block := range applied {
-		w.consensusSetHeight++
+		// increment the consensus height
+		consensusHeight, err := dbGetConsensusHeight(tx)
+		if err != nil {
+			return err
+		}
+		consensusHeight++
+		err = dbPutConsensusHeight(tx, consensusHeight)
+		if err != nil {
+			return err
+		}
+
 		relevant := false
 		for i, mp := range block.MinerPayouts {
 			relevant = relevant || w.isWalletAddress(mp.UnlockHash)
@@ -114,13 +133,13 @@ func (w *Wallet) applyHistory(tx *bolt.Tx, applied []types.Block) error {
 			minerPT := modules.ProcessedTransaction{
 				Transaction:           types.Transaction{},
 				TransactionID:         types.TransactionID(block.ID()),
-				ConfirmationHeight:    w.consensusSetHeight,
+				ConfirmationHeight:    consensusHeight,
 				ConfirmationTimestamp: block.Timestamp,
 			}
 			for _, mp := range block.MinerPayouts {
 				minerPT.Outputs = append(minerPT.Outputs, modules.ProcessedOutput{
 					FundType:       types.SpecifierMinerPayout,
-					MaturityHeight: w.consensusSetHeight + types.MaturityDelay,
+					MaturityHeight: consensusHeight + types.MaturityDelay,
 					WalletAddress:  w.isWalletAddress(mp.UnlockHash),
 					RelatedAddress: mp.UnlockHash,
 					Value:          mp.Value,
@@ -169,7 +188,7 @@ func (w *Wallet) applyHistory(tx *bolt.Tx, applied []types.Block) error {
 			pt := modules.ProcessedTransaction{
 				Transaction:           txn,
 				TransactionID:         txn.ID(),
-				ConfirmationHeight:    w.consensusSetHeight,
+				ConfirmationHeight:    consensusHeight,
 				ConfirmationTimestamp: block.Timestamp,
 			}
 
@@ -189,7 +208,7 @@ func (w *Wallet) applyHistory(tx *bolt.Tx, applied []types.Block) error {
 			for _, sco := range txn.SiacoinOutputs {
 				pt.Outputs = append(pt.Outputs, modules.ProcessedOutput{
 					FundType:       types.SpecifierSiacoinOutput,
-					MaturityHeight: w.consensusSetHeight,
+					MaturityHeight: consensusHeight,
 					WalletAddress:  w.isWalletAddress(sco.UnlockHash),
 					RelatedAddress: sco.UnlockHash,
 					Value:          sco.Value,
@@ -214,7 +233,7 @@ func (w *Wallet) applyHistory(tx *bolt.Tx, applied []types.Block) error {
 				claimValue := w.siafundPool.Sub(startVal).Mul(sfiValue)
 				pt.Outputs = append(pt.Outputs, modules.ProcessedOutput{
 					FundType:       types.SpecifierClaimOutput,
-					MaturityHeight: w.consensusSetHeight + types.MaturityDelay,
+					MaturityHeight: consensusHeight + types.MaturityDelay,
 					WalletAddress:  w.isWalletAddress(sfi.UnlockConditions.UnlockHash()),
 					RelatedAddress: sfi.ClaimUnlockHash,
 					Value:          claimValue,
@@ -224,7 +243,7 @@ func (w *Wallet) applyHistory(tx *bolt.Tx, applied []types.Block) error {
 			for _, sfo := range txn.SiafundOutputs {
 				pt.Outputs = append(pt.Outputs, modules.ProcessedOutput{
 					FundType:       types.SpecifierSiafundOutput,
-					MaturityHeight: w.consensusSetHeight,
+					MaturityHeight: consensusHeight,
 					WalletAddress:  w.isWalletAddress(sfo.UnlockHash),
 					RelatedAddress: sfo.UnlockHash,
 					Value:          sfo.Value,
@@ -264,10 +283,14 @@ func (w *Wallet) ProcessConsensusChange(cc modules.ConsensusChange) {
 		if err := w.updateConfirmedSet(tx, cc); err != nil {
 			return err
 		}
-		if err := w.revertHistory(tx, cc); err != nil {
+		if err := w.revertHistory(tx, cc.RevertedBlocks); err != nil {
 			return err
 		}
-		return w.applyHistory(tx, cc.AppliedBlocks)
+		if err := w.applyHistory(tx, cc.AppliedBlocks); err != nil {
+			return err
+		}
+		// update the ConsensusChangeID
+		return dbPutConsensusChangeID(tx, cc.ID)
 	})
 	if err != nil {
 		w.log.Println("ERROR: failed to add consensus change:", err)

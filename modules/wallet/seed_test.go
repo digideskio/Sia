@@ -9,7 +9,19 @@ import (
 	"github.com/NebulousLabs/Sia/crypto"
 	"github.com/NebulousLabs/Sia/modules"
 	"github.com/NebulousLabs/Sia/types"
+	"github.com/NebulousLabs/bolt"
 )
+
+// resetChangeID clears the wallet's ConsensusChangeID. When Unlock is called,
+// the wallet will rescan from the genesis block.
+func resetChangeID(w *Wallet) {
+	err := w.db.Update(func(tx *bolt.Tx) error {
+		return dbPutConsensusChangeID(tx, modules.ConsensusChangeBeginning)
+	})
+	if err != nil {
+		panic(err)
+	}
+}
 
 // TestPrimarySeed checks that the correct seed is returned when calling
 // PrimarySeed.
@@ -102,10 +114,9 @@ func TestLoadSeed(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(allSeeds) != 1 {
-		t.Error("AllSeeds should be returning the primary seed.")
-	}
-	if allSeeds[0] != seed {
-		t.Error("AllSeeds returned the wrong seed")
+		t.Fatal("AllSeeds should be returning the primary seed.")
+	} else if allSeeds[0] != seed {
+		t.Fatal("AllSeeds returned the wrong seed")
 	}
 	wt.wallet.Close()
 
@@ -138,7 +149,7 @@ func TestLoadSeed(t *testing.T) {
 	if len(allSeeds) != 2 {
 		t.Error("AllSeeds should be returning the primary seed with the recovery seed.")
 	}
-	if !bytes.Equal(allSeeds[0][:], newSeed[:]) {
+	if allSeeds[0] != newSeed {
 		t.Error("AllSeeds returned the wrong seed")
 	}
 	if !bytes.Equal(allSeeds[1][:], seed[:]) {
@@ -149,10 +160,15 @@ func TestLoadSeed(t *testing.T) {
 	// Rather than worry about a rescan, which isn't implemented and has
 	// synchronization difficulties, just load a new wallet from the same
 	// settings file - the same effect is achieved without the difficulties.
+	//
+	// TODO: when proper seed loading is implemented, just check the balance
+	// of w directly.
 	w2, err := New(wt.cs, wt.tpool, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
+	// reset the ccID so that the wallet does a full rescan
+	resetChangeID(w2)
 	err = w2.Unlock(crypto.TwofishKey(crypto.HashObject(newSeed)))
 	if err != nil {
 		t.Fatal(err)

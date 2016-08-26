@@ -93,9 +93,14 @@ func (tb *transactionBuilder) FundSiacoins(amount types.Currency) error {
 	defer tb.wallet.mu.Unlock()
 
 	return tb.wallet.db.Update(func(tx *bolt.Tx) error {
+		consensusHeight, err := dbGetConsensusHeight(tx)
+		if err != nil {
+			return err
+		}
+
 		// Collect a value-sorted set of siacoin outputs.
 		var so sortedOutputs
-		err := dbForEachSiacoinOutput(tx, func(scoid types.SiacoinOutputID, sco types.SiacoinOutput) {
+		err = dbForEachSiacoinOutput(tx, func(scoid types.SiacoinOutputID, sco types.SiacoinOutput) {
 			so.ids = append(so.ids, scoid)
 			so.outputs = append(so.outputs, sco)
 		})
@@ -136,8 +141,8 @@ func (tb *transactionBuilder) FundSiacoins(amount types.Currency) error {
 				spendHeight = 0
 			}
 			// Prevent an underflow error.
-			allowedHeight := tb.wallet.consensusSetHeight - RespendTimeout
-			if tb.wallet.consensusSetHeight < RespendTimeout {
+			allowedHeight := consensusHeight - RespendTimeout
+			if consensusHeight < RespendTimeout {
 				allowedHeight = 0
 			}
 			if spendHeight > allowedHeight {
@@ -145,7 +150,7 @@ func (tb *transactionBuilder) FundSiacoins(amount types.Currency) error {
 				continue
 			}
 			outputUnlockConditions := tb.wallet.keys[sco.UnlockHash].UnlockConditions
-			if tb.wallet.consensusSetHeight < outputUnlockConditions.Timelock {
+			if consensusHeight < outputUnlockConditions.Timelock {
 				continue
 			}
 
@@ -173,10 +178,11 @@ func (tb *transactionBuilder) FundSiacoins(amount types.Currency) error {
 
 		// Create and add the output that will be used to fund the standard
 		// transaction.
-		parentUnlockConditions, err := tb.wallet.nextPrimarySeedAddress()
+		parentUnlockConditions, err := tb.wallet.nextPrimarySeedAddress(tx)
 		if err != nil {
 			return err
 		}
+
 		exactOutput := types.SiacoinOutput{
 			Value:      amount,
 			UnlockHash: parentUnlockConditions.UnlockHash(),
@@ -185,7 +191,7 @@ func (tb *transactionBuilder) FundSiacoins(amount types.Currency) error {
 
 		// Create a refund output if needed.
 		if amount.Cmp(fund) != 0 {
-			refundUnlockConditions, err := tb.wallet.nextPrimarySeedAddress()
+			refundUnlockConditions, err := tb.wallet.nextPrimarySeedAddress(tx)
 			if err != nil {
 				return err
 			}
@@ -205,7 +211,7 @@ func (tb *transactionBuilder) FundSiacoins(amount types.Currency) error {
 		}
 		// Mark the parent output as spent. Must be done after the transaction is
 		// finished because otherwise the txid and output id will change.
-		err = dbPutSpentOutput(tx, types.OutputID(parentTxn.SiacoinOutputID(0)), tb.wallet.consensusSetHeight)
+		err = dbPutSpentOutput(tx, types.OutputID(parentTxn.SiacoinOutputID(0)), consensusHeight)
 		if err != nil {
 			return err
 		}
@@ -222,7 +228,7 @@ func (tb *transactionBuilder) FundSiacoins(amount types.Currency) error {
 
 		// Mark all outputs that were spent as spent.
 		for _, scoid := range spentScoids {
-			err = dbPutSpentOutput(tx, types.OutputID(scoid), tb.wallet.consensusSetHeight)
+			err = dbPutSpentOutput(tx, types.OutputID(scoid), consensusHeight)
 			if err != nil {
 				return err
 			}
@@ -240,6 +246,11 @@ func (tb *transactionBuilder) FundSiafunds(amount types.Currency) error {
 	defer tb.wallet.mu.Unlock()
 
 	return tb.wallet.db.Update(func(tx *bolt.Tx) error {
+		consensusHeight, err := dbGetConsensusHeight(tx)
+		if err != nil {
+			return err
+		}
+
 		// Create and fund a parent transaction that will add the correct amount of
 		// siafunds to the transaction.
 		var fund types.Currency
@@ -263,8 +274,8 @@ func (tb *transactionBuilder) FundSiafunds(amount types.Currency) error {
 				spendHeight = 0
 			}
 			// Prevent an underflow error.
-			allowedHeight := tb.wallet.consensusSetHeight - RespendTimeout
-			if tb.wallet.consensusSetHeight < RespendTimeout {
+			allowedHeight := consensusHeight - RespendTimeout
+			if consensusHeight < RespendTimeout {
 				allowedHeight = 0
 			}
 			if spendHeight > allowedHeight {
@@ -272,12 +283,12 @@ func (tb *transactionBuilder) FundSiafunds(amount types.Currency) error {
 				continue
 			}
 			outputUnlockConditions := tb.wallet.keys[sfo.UnlockHash].UnlockConditions
-			if tb.wallet.consensusSetHeight < outputUnlockConditions.Timelock {
+			if consensusHeight < outputUnlockConditions.Timelock {
 				continue
 			}
 
 			// Add a siafund input for this output.
-			parentClaimUnlockConditions, err := tb.wallet.nextPrimarySeedAddress()
+			parentClaimUnlockConditions, err := tb.wallet.nextPrimarySeedAddress(tx)
 			if err != nil {
 				return err
 			}
@@ -305,7 +316,7 @@ func (tb *transactionBuilder) FundSiafunds(amount types.Currency) error {
 
 		// Create and add the output that will be used to fund the standard
 		// transaction.
-		parentUnlockConditions, err := tb.wallet.nextPrimarySeedAddress()
+		parentUnlockConditions, err := tb.wallet.nextPrimarySeedAddress(tx)
 		if err != nil {
 			return err
 		}
@@ -317,7 +328,7 @@ func (tb *transactionBuilder) FundSiafunds(amount types.Currency) error {
 
 		// Create a refund output if needed.
 		if amount.Cmp(fund) != 0 {
-			refundUnlockConditions, err := tb.wallet.nextPrimarySeedAddress()
+			refundUnlockConditions, err := tb.wallet.nextPrimarySeedAddress(tx)
 			if err != nil {
 				return err
 			}
@@ -337,7 +348,7 @@ func (tb *transactionBuilder) FundSiafunds(amount types.Currency) error {
 		}
 
 		// Add the exact output.
-		claimUnlockConditions, err := tb.wallet.nextPrimarySeedAddress()
+		claimUnlockConditions, err := tb.wallet.nextPrimarySeedAddress(tx)
 		if err != nil {
 			return err
 		}
@@ -353,7 +364,7 @@ func (tb *transactionBuilder) FundSiafunds(amount types.Currency) error {
 
 		// Mark all outputs that were spent as spent.
 		for _, sfoid := range spentSfoids {
-			err = dbPutSpentOutput(tx, types.OutputID(sfoid), tb.wallet.consensusSetHeight)
+			err = dbPutSpentOutput(tx, types.OutputID(sfoid), consensusHeight)
 			if err != nil {
 				return err
 			}
